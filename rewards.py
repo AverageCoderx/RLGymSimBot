@@ -2,12 +2,75 @@ import numpy as np # Import numpy, the python math library
 import math
 from numpy.linalg import norm
 from math import exp
-from rlgym.utils.math import cosine_similarity
+from rlgym_sim.utils.math import cosine_similarity
 from rlgym_sim.utils import RewardFunction # Import the base RewardFunction class
 from rlgym_sim.utils.gamestates import GameState, PlayerData # Import game state stuff
-from rlgym.utils.common_values import (BLUE_GOAL_BACK, BLUE_GOAL_CENTER, ORANGE_GOAL_BACK,
+from rlgym_sim.utils.common_values import (BLUE_GOAL_BACK, BLUE_GOAL_CENTER, ORANGE_GOAL_BACK,
                                        ORANGE_GOAL_CENTER, CAR_MAX_SPEED, ORANGE_TEAM, CAR_MAX_SPEED, BALL_MAX_SPEED, ORANGE_TEAM, BLUE_TEAM,)
 
+def distance2D(p1, p2):
+    return np.linalg.norm(p2 - p1)
+
+def normalize(vector):
+    norm = np.linalg.norm(vector)
+    if norm == 0:
+        return vector
+    return vector / norm
+
+class VelocityBallToGoalReward(RewardFunction):
+    def __init__(self, own_goal=False, use_scalar_projection=False):
+        super().__init__()
+        self.own_goal = own_goal
+        self.use_scalar_projection = use_scalar_projection
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        if player.team_num == BLUE_TEAM and not self.own_goal \
+                or player.team_num == ORANGE_TEAM and self.own_goal:
+            objective = np.array(ORANGE_GOAL_BACK)
+        else:
+            objective = np.array(BLUE_GOAL_BACK)
+
+        vel = state.ball.linear_velocity
+        pos_diff = objective - state.ball.position
+        if self.use_scalar_projection:
+            # Vector version of v=d/t <=> t=d/v <=> 1/t=v/d
+            # Max value should be max_speed / ball_radius = 2300 / 94 = 24.5
+            # Used to guide the agent towards the ball
+            inv_t = math.scalar_projection(vel, pos_diff)
+            return inv_t
+        else:
+            # Regular component velocity
+            norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
+            norm_vel = vel / BALL_MAX_SPEED
+            return float(np.dot(norm_pos_diff, norm_vel))
+
+class AlignBallGoal(RewardFunction):
+    def __init__(self, defense=1., offense=1.):
+        super().__init__()
+        self.defense = defense
+        self.offense = offense
+
+    def reset(self, initial_state: GameState):
+        pass
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        ball = state.ball.position
+        pos = player.car_data.position
+        protecc = np.array(BLUE_GOAL_BACK)
+        attacc = np.array(ORANGE_GOAL_BACK)
+        if player.team_num == ORANGE_TEAM:
+            protecc, attacc = attacc, protecc
+
+        # Align player->ball and net->player vectors
+        defensive_reward = self.defense * math.cosine_similarity(ball - pos, pos - protecc)
+
+        # Align player->ball and player->net vectors
+        offensive_reward = self.offense * math.cosine_similarity(ball - pos, attacc - pos)
+
+        return defensive_reward + offensive_reward
 
 class InAirReward(RewardFunction): # We extend the class "RewardFunction"
     # Empty default constructor (required)
@@ -182,6 +245,9 @@ class SpeedReward(RewardFunction):
         return min(car_speed, 1)
 
 class AerialNavigation(RewardFunction):
+    # TODO
+    # Make it reward for multiple touches in the air
+    # Make it reward for being closer to the ball
     def __init__(
         self, ball_height_min=400, player_height_min=200, beginner=True  # make sure to change beginner eventually
     ) -> None:
@@ -227,6 +293,8 @@ class AerialNavigation(RewardFunction):
                     reward += 0.5
             self.previous_distance = current_distance
 
+            if player.ball_touched:
+                reward = reward * 1.5
         return max(reward, 0)
 
 class BoostReward(RewardFunction):
@@ -351,7 +419,7 @@ class BoostLoseReward(RewardFunction):
         reward = 0.0
         if boost_diff < 0:
             car_height = player.car_data.position[2]
-            penalty = self.boost_lose_w * boost_diff * (1 - car_height / GOAL_HEIGHT)
+            penalty = self.boost_lose_w * boost_diff * (1 - car_height / 642.775) #goal height
             reward += penalty
         return float(reward)
 
@@ -378,52 +446,203 @@ class FlipResetReward(RewardFunction):
 
         return reward
 
-class AerialDistanceReward(RewardFunction):
-    def __init__(self, height_scale: float, distance_scale: float):
+# start of opti's rewards
+class FlipResetRewardOPTI(RewardFunction):
+    def __init__(self):
         super().__init__()
-        self.height_scale = height_scale
-        self.distance_scale = distance_scale
+        # Reward weights and parameters (set these based on your needs)
+        self.flip_reset_w = 10  # Reward for a successful flip reset
+        self.quick_flip_reset_w = 5  # Reward for quick first flip reset
+        self.quick_flip_reset_norm_steps = 100  # Normalization steps for quick flip reset
+        self.flip_reset_delay_steps = 50  # Delay steps for subsequent resets
+        self.inc_flip_reset_w = 2  # Incremental reward for consecutive resets
+        self.prevent_chain_reset = True  # Whether to prevent consecutive resets
+        self.cancel_flip_reset_indices = None  # Actions to cancel a flip reset (can be filled with a list of indices)
 
-        self.current_car: Optional[PlayerData] = None
-        self.prev_state: Optional[GameState] = None
-        self.ball_distance: float = 0
-        self.car_distance: float = 0
+        self.got_reset = [False] * 8  # Keep track of reset status for each player (assuming 8 players)
+        self.cons_resets = 0  # Counter for consecutive resets
+        self.reset_timer = -100000  # Timer to track time since last reset
+        self.kickoff_timer = 1000  # Set the time until the kickoff is finished
 
     def reset(self, initial_state: GameState):
-        self.current_car = None
-        self.prev_state = initial_state
+        # Reset logic when the game resets (this is called at the start of the game)
+        self.got_reset = [False] * 8  # Reset reset status for each player
+        self.cons_resets = 0  # Reset the consecutive reset counter
+        self.reset_timer = -100000  # Reset the reset timer
+
+    def get_reward(self, player: PlayerData, state: GameState) -> float:
+        reward = 0
+
+        # Loop over all players (assuming `player` is the current player whose reward is being calculated)
+        i = player.index  # Get the player's index
+        last = state.players[i - 1]  # The last player's data (for checking the jump state)
+
+        # Check for flip reset (first flip reset of the episode)
+        if not last.has_jump and player.has_jump and state.ball.position[2] > 200 and \
+                np.linalg.norm(state.ball.position - player.car_data.position) < 110 and \
+                cosine_similarity(state.ball.position - player.car_data.position, -player.car_data.up()) > 0.9:
+            if not self.got_reset[i]:  # First reset of episode
+                reward += self.quick_flip_reset_w * self.quick_flip_reset_norm_steps / self.kickoff_timer
+            self.got_reset[i] = True
+
+            # Reward for successful flip reset (after first reset)
+            if (self.kickoff_timer - self.reset_timer > self.flip_reset_delay_steps and self.prevent_chain_reset) or \
+                    not self.prevent_chain_reset:
+                if previous_action is not None and self.cancel_flip_reset_indices is not None and \
+                        previous_action[i] not in self.cancel_flip_reset_indices:
+                    reward += self.flip_reset_w
+                self.cons_resets += 1
+                if self.cons_resets > 1:
+                    reward += self.inc_flip_reset_w * min((1.4 ** self.cons_resets), 6) / 6
+            self.reset_timer = self.kickoff_timer
+
+        # Reset the counters if the player is on the ground (no more flip resets allowed)
+        elif player.on_ground:
+            self.cons_resets = 0
+            self.reset_timer = -100000
+
+        return reward
+
+class FlipResetHelperRewardOPTI(RewardFunction):
+    def __init__(self, flip_reset_help_w=1.0):
+        """
+        Constructor to initialize the flip reset help weight.
+        :param flip_reset_help_w: Weight to scale the flip reset reward (default is 1.0).
+        """
+        super().__init__()
+        self.flip_reset_help_w = flip_reset_help_w
+
+    def reset(self, initial_state: GameState):
+        """
+        Reset does nothing in this case.
+        """
+        pass
 
     def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
-        rew = 0
-        is_current = self.current_car is not None and self.current_car.car_id == player.car_id
-        # Test if player is on the ground
+        """
+        Calculate the reward for a specific player, at the current state.
+        This reward encourages the bot to position itself for a potential flip reset.
+
+        :param player: The PlayerData object representing the player.
+        :param state: The current GameState.
+        :param previous_action: The previous action taken by the player.
+        :return: The calculated reward.
+        """
+        reward = 0
+
+        if self.flip_reset_help_w != 0:
+            # Calculate the 'upness' of the player's car (how aligned it is with the ceiling)
+            upness = cosine_similarity(
+                np.asarray([0, 0, CEILING_Z - player.car_data.position[2]]),
+                -player.car_data.up()  # bottom of the car points towards the ceiling
+            )
+
+            # Calculate how far the player is from the walls
+            from_wall_ratio = min(1, abs(state.ball.position[0]) / 1300)
+
+            # Calculate the height of the ball relative to the field
+            height_ratio = min(1, state.ball.position[2] / 1700)
+
+            # Calculate how aligned the ball is with the bottom of the car
+            bottom_ball_ratio = 2 * cosine_similarity(
+                state.ball.position - player.car_data.position, -player.car_data.up()
+            )
+
+            # Determine the goal objective based on the player's team
+            if player.team_num == BLUE_TEAM:
+                objective = np.array(ORANGE_GOAL_BACK)
+            else:
+                objective = np.array(BLUE_GOAL_BACK)
+
+            # Calculate how aligned the player is with the objective (goal)
+            align_ratio = cosine_similarity(
+                objective - player.car_data.position, player.car_data.forward()
+            )
+
+            # Calculate the positional difference between the player and the ball, with extra weight on the Z-axis (height)
+            pos_diff = state.ball.position - player.car_data.position
+            pos_diff[2] *= 2  # Make the Z-axis difference more important
+            norm_pos_diff = np.linalg.norm(pos_diff)
+
+            # Calculate the final flip reset reward based on the factors
+            flip_rew = bottom_ball_ratio * from_wall_ratio * height_ratio * align_ratio * \
+                       np.clip(-1, 1, 40 * upness / (norm_pos_diff + 1))
+
+            # Apply the weight factor to the final reward
+            reward += self.flip_reset_help_w * flip_rew
+
+        return reward
+
+class AerialDistanceReward(RewardFunction):
+    def __init__(self, height_scale = 0.5, distance_scale = 0.5):
+        """
+        Initializes the AerialDistanceReward function.
+        :param height_scale: Scaling factor for rewarding height during aerial play.
+        :param distance_scale: Scaling factor for rewarding distances traveled during aerial play.
+        """
+        super().__init__()
+        self.height_scale = height_scale  # Scale for height-based rewards
+        self.distance_scale = distance_scale  # Scale for distance-based rewards
+
+        # Variables to track current player, previous state, and distances
+        self.current_car: Optional[PlayerData] = None
+        self.prev_state: Optional[GameState] = None
+        self.ball_distance: float = 0  # Distance the ball has traveled
+        self.car_distance: float = 0  # Distance the car has traveled
+
+    def reset(self, initial_state: GameState):
+        """
+        Resets the state of the reward function.
+        :param initial_state: The initial state of the game.
+        """
+        self.current_car = None  # No player currently tracked
+        self.prev_state = initial_state  # Store the initial state for comparison
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        """
+        Calculates the aerial distance reward for the given player.
+        :param player: The current player.
+        :param state: The current game state.
+        :param previous_action: The last action taken by the player (not used here).
+        :return: A scaled reward value for aerial distance and touches.
+        """
+        rew = 0  # Initialize reward
+        is_current = self.current_car is not None and self.current_car.car_id == player.car_id  # Check if player is tracked
+
+        # Check if the player is on the ground
         if player.car_data.position[2] < RAMP_HEIGHT:
-            if is_current:
+            if is_current:  # If the tracked player is now on the ground, reset tracking
                 is_current = False
                 self.current_car = None
-        # First non ground touch detection
+        # Detect the first aerial touch
         elif player.ball_touched and not is_current:
-            is_current = True
-            self.ball_distance = 0
-            self.car_distance = 0
+            is_current = True  # Start tracking the player
+            self.ball_distance = 0  # Reset ball distance
+            self.car_distance = 0  # Reset car distance
+            # Reward for initial aerial height, scaled by height_scale
             rew = self.height_scale * max(player.car_data.position[2] + state.ball.position[2] - 2 * RAMP_HEIGHT, 0)
-        # Still off the ground after a touch, add distance and reward for more touches
+        # If the player is still in the air after the initial touch
         elif is_current:
+            # Accumulate car travel distance since the last frame
             self.car_distance += np.linalg.norm(player.car_data.position - self.current_car.car_data.position)
+            # Accumulate ball travel distance since the last frame
             self.ball_distance += np.linalg.norm(state.ball.position - self.prev_state.ball.position)
-            # Cash out on touches
+            # Reward for additional touches, based on accumulated distances
             if player.ball_touched:
-                rew = self.distance_scale * (self.car_distance + self.ball_distance)
-                self.car_distance = 0
-                self.ball_distance = 0
+                rew = self.distance_scale * (self.car_distance + self.ball_distance)  # Reward based on total distance
+                self.car_distance = 0  # Reset car distance
+                self.ball_distance = 0  # Reset ball distance
 
         if is_current:
-            self.current_car = player  # Update to get latest physics info
+            # Update current car to the latest player data for tracking
+            self.current_car = player
 
+        # Update previous state for the next frame comparison
         self.prev_state = state
 
+        # Normalize reward by the maximum possible distance (2 * BACK_WALL_Y)
         return rew / (2 * BACK_WALL_Y)
-        
+
 class ExampleReward(RewardFunction):
     # Default constructor
     def __init__(self):
@@ -438,3 +657,4 @@ class ExampleReward(RewardFunction):
         reward = 0
         #reward logic here
         return reward
+
